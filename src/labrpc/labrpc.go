@@ -151,6 +151,7 @@ func MakeNetwork() *Network {
 	go func() {
 		for {
 			select {
+			// note: Client calls Call() to send reqMsg to channel rn.endCh
 			case xreq := <-rn.endCh:
 				atomic.AddInt32(&rn.count, 1)
 				atomic.AddInt64(&rn.bytes, int64(len(xreq.args)))

@@ -27,6 +27,7 @@ type LogTopic string
 const (
 	Client  LogTopic = "CLNT"
 	Commit  LogTopic = "CMIT"
+	Apply   LogTopic = "APLY"
 	Drop    LogTopic = "DROP"
 	Error   LogTopic = "ERRO"
 	Info    LogTopic = "INFO"

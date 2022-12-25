@@ -19,6 +19,7 @@ TOPICS = {
     "LOG1": "#4878bc",
     "LOG2": "#398280",
     "CMIT": "#98719f",
+    "APLY": "#fe2626",
     "PERS": "#d08341",
     "SNAP": "#FD971F",
     "DROP": "#ff615c",
