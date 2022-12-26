@@ -47,7 +47,7 @@ const (
 var debugStart time.Time
 var debugVerbosity int
 
-func Init() {
+func init() {
 	debugVerbosity = getVerbosity()
 	debugStart = time.Now()
 

@@ -10,7 +10,6 @@ package raft
 
 import "6.824/labgob"
 import "6.824/labrpc"
-import "6.824/pretty"
 import "bytes"
 import "log"
 import "sync"
@@ -93,7 +92,6 @@ func make_config(t *testing.T, n int, unreliable bool, snapshot bool) *config {
 		applier = cfg.applierSnap
 	}
 	// create a full set of Rafts.
-	pretty.Init()
 	for i := 0; i < cfg.n; i++ {
 		cfg.logs[i] = map[int]interface{}{}
 		cfg.start1(i, applier)
