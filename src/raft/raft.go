@@ -425,6 +425,8 @@ func (rf *Raft) replicateEntries(index int, term int) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	iters := 0
+	// if not send AE after a timeout, 
+	// the unreliable tests will be very slow
 	for !rf.killed() && (rf.role == Leader) && (index == len(rf.logs)) && (rf.currentTerm == term) {
 		if iters%10 == 0 {
 			pretty.Debug(pretty.Timer, "S%d starts one round of sending AEs", rf.me)
@@ -437,13 +439,11 @@ func (rf *Raft) replicateEntries(index int, term int) {
 			}
 			if index >= rf.nextIndex[i] {
 				sent = true
+				req := rf.createAppendEntry(term, i)
+				req.Logs = rf.logs[req.PrevLogIndex:index]
 				go func(i int) {
-					rf.mu.Lock()
-					req := rf.createAppendEntry(term, i)
-					req.Logs = rf.logs[req.PrevLogIndex:index]
-					rsp := new(AppendEntriesReply)
-					rf.mu.Unlock()
 					pretty.Debug(pretty.Log, "S%d > S%d AE", rf.me, i)
+					rsp := new(AppendEntriesReply)
 					ok := rf.sendAppendEntries(i, req, rsp)
 					if ok {
 						rf.mu.Lock()
