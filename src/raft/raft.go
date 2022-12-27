@@ -18,7 +18,9 @@ package raft
 //
 
 import (
-	//	"bytes"
+	"bytes"
+	"log"
+
 	// crand "crypto/rand"
 
 	"math/rand"
@@ -26,7 +28,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	//	"6.824/labgob"
+	"6.824/labgob"
 	"6.824/labrpc"
 	"6.824/pretty"
 )
@@ -95,7 +97,6 @@ type Raft struct {
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
-
 	var term int
 	var isleader bool
 	// Your code here (2A).
@@ -110,13 +111,25 @@ func (rf *Raft) GetState() (int, bool) {
 // see paper's Figure 2 for a description of what should be persistent.
 func (rf *Raft) persist() {
 	// Your code here (2C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
+	// assume rf.mu is locked when this func is called
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	if err := e.Encode(rf.currentTerm); err != nil {
+		log.Fatal("Encode currentTerm failed")
+	}
+	if err := e.Encode(rf.votedFor); err != nil {
+		log.Fatal("Encode voteFor failed")
+	}
+	if err := e.Encode(len(rf.logs)); err != nil {
+		log.Fatal("Encode len(rf.logs) failed")
+	}
+	for i := 0; i < len(rf.logs); i++ {
+		if err := e.Encode(rf.logs[i]); err != nil {
+			log.Fatal("Encode logEntry failed")
+		}
+	}
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 // restore previously persisted state.
@@ -125,18 +138,25 @@ func (rf *Raft) readPersist(data []byte) {
 		return
 	}
 	// Your code here (2C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var currentTerm, votedFor, logNum int
+	var newLogs []LogEntry
+	if d.Decode(&currentTerm) != nil ||
+		d.Decode(&votedFor) != nil ||
+		d.Decode(&logNum) != nil {
+		log.Fatal("Decode Raft's persisted state failed")
+	} else {
+		rf.currentTerm = currentTerm
+		rf.votedFor = votedFor
+		newLogs = make([]LogEntry, logNum)
+	}
+	for i := 0; i < logNum; i++ {
+		if d.Decode(&newLogs[i]) != nil {
+			log.Fatal("Decode logEntry failed")
+		}
+	}
+	rf.logs = newLogs
 }
 
 // A service wants to switch to snapshot.  Only do so if Raft hasn't
@@ -185,12 +205,19 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-
+	changed := new(bool)
+	*changed = false
 	if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
 		rf.votedFor = -1
 		rf.role = Follower
+		*changed = true
 	}
+	defer func() {
+		if *changed {
+			rf.persist()
+		}
+	}()
 	// decide if the logs of this follower is more up-to-date
 	lastLogIndex := len(rf.logs)
 	lastLogTerm := 0
@@ -208,6 +235,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 	if rf.role == Follower {
 		rf.reElect = false
+	}
+	if rf.votedFor != args.CandidateId {
+		*changed = true
 	}
 	rf.votedFor = args.CandidateId
 	reply.Term = rf.currentTerm
@@ -259,6 +289,9 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    int
 	Success bool
+	// for optimization
+	ConflictTerm  int
+	ConflictIndex int
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -269,15 +302,26 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	changed := new(bool)
+	*changed = false
+	defer func() {
+		if *changed {
+			rf.persist()
+		}
+	}()
 	if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
 		rf.votedFor = -1
 		rf.role = Follower
+		*changed = true
 	}
 	if args.Term == rf.currentTerm {
 		rf.reElect = false
 		if rf.role == Candidate {
 			rf.role = Follower
+			if rf.votedFor != -1 {
+				*changed = true
+			}
 			rf.votedFor = -1
 		}
 	}
@@ -292,9 +336,16 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			rf.logs[args.PrevLogIndex-1].Term == args.PrevLogTerm) {
 		if len(args.Logs) > 0 {
 			reply.Success = true
-			rf.logs = rf.logs[0:args.PrevLogIndex]
-			rf.logs = append(rf.logs, args.Logs...)
-			pretty.Debug(pretty.Log, "S%d store logs from S%d", rf.me, args.LeaderId)
+			// rpc requests may be received out of order,
+			// so we need this check here, or entries appended by previous request
+			// may be deleted later
+			if len(rf.logs) < (args.PrevLogIndex + len(args.Logs)) {
+				rf.logs = rf.logs[0:args.PrevLogIndex]
+				rf.logs = append(rf.logs, args.Logs...)
+				*changed = true
+			}
+			pretty.Debug(pretty.Log, "S%d store logs from S%d (len=%d) (prev=%d len=%d)",
+				rf.me, args.LeaderId, len(rf.logs), args.PrevLogIndex, len(args.Logs))
 		}
 		if args.LeaderCommitId > rf.commitIndex {
 			rf.commitIndex = args.LeaderCommitId
@@ -302,6 +353,27 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				rf.commitIndex = len(rf.logs)
 			}
 			rf.cond.Signal()
+		}
+	} else {
+		// Consistency check failed, so follower should return some info to leader
+		// for bypassing conflict entries
+		if len(args.Logs) > 0 {
+			if len(rf.logs) >= args.PrevLogIndex {
+				reply.ConflictTerm = rf.logs[args.PrevLogIndex-1].Term
+				reply.ConflictIndex = args.PrevLogIndex
+				for i := args.PrevLogIndex - 1; i > 0 && i > rf.commitIndex; i-- {
+					if rf.logs[i-1].Term == reply.ConflictTerm {
+						reply.ConflictIndex = i
+					} else {
+						break
+					}
+				}
+				rf.logs = rf.logs[0 : args.PrevLogIndex-1]
+				// *changed = true
+			} else {
+				reply.ConflictTerm = -1
+				reply.ConflictIndex = len(rf.logs) + 1
+			}
 		}
 	}
 }
@@ -318,14 +390,14 @@ func (rf *Raft) applyCommitLogs() {
 		for rf.commitIndex == rf.lastApplied {
 			rf.cond.Wait()
 		}
+		rf.lastApplied++
 		applyMsg := ApplyMsg{
 			CommandValid: true,
-			Command:      rf.logs[rf.lastApplied].Command,
-			CommandIndex: rf.lastApplied + 1,
+			Command:      rf.logs[rf.lastApplied-1].Command,
+			CommandIndex: rf.lastApplied,
 		}
 		pretty.Debug(pretty.Apply, "S%d apply: command %v index %d",
 			rf.me, applyMsg.Command, applyMsg.CommandIndex)
-		rf.lastApplied++
 		rf.cond.L.Unlock()
 		rf.applyCh <- applyMsg
 	}
@@ -356,6 +428,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		term = rf.currentTerm
 		// create log entry
 		rf.logs = append(rf.logs, LogEntry{term, command})
+		rf.persist()
 		// send AppendEntries RPC to all servers
 		pretty.Debug(pretty.Log, "S%d broadcast AE rpc", rf.me)
 		for i := 0; i < len(rf.peers); i++ {
@@ -372,13 +445,17 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 					if prevIndex > 0 {
 						prevTerm = rf.logs[prevIndex-1].Term
 					}
+					cID := rf.matchIndex[i]
+					if rf.commitIndex < cID {
+						cID = rf.commitIndex
+					}
 					req := AppendEntriesArgs{
 						Term:           term,
 						LeaderId:       rf.me,
 						PrevLogIndex:   prevIndex,
 						PrevLogTerm:    prevTerm,
 						Logs:           rf.logs[prevIndex:index],
-						LeaderCommitId: rf.commitIndex,
+						LeaderCommitId: cID,
 					}
 					rsp := AppendEntriesReply{}
 					rf.mu.Unlock()
@@ -390,8 +467,9 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 							rf.role = Follower
 							rf.currentTerm = rsp.Term
 							rf.votedFor = -1
+							rf.persist()
 							pretty.Debug(pretty.Log, "S%d became follower because rev AE from S%d", rf.me, i)
-						} else if (rf.role == Leader) && (index == len(rf.logs)) {
+						} else if (rf.role == Leader) && (index == len(rf.logs) && (req.Term == rf.currentTerm)) {
 							if rsp.Success {
 								rf.nextIndex[i] = index + 1
 								rf.matchIndex[i] = index
@@ -419,9 +497,16 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 									rf.cond.Signal()
 								}
 							} else {
-								if rf.nextIndex[i] != 1 {
-									rf.nextIndex[i]--
+								if rsp.ConflictIndex != 0 { // rpc call may failed because of network
+									if rf.logs[rsp.ConflictIndex-1].Term == rsp.ConflictTerm {
+										rf.nextIndex[i] = rsp.ConflictIndex + 1
+									} else {
+										rf.nextIndex[i] = rsp.ConflictIndex
+									}
 								}
+								// if rf.nextIndex[i] != 1 {
+								// 	rf.nextIndex[i]--
+								// }
 							}
 						}
 					}
@@ -467,6 +552,7 @@ func (rf *Raft) ticker() {
 			rf.currentTerm++
 			term = rf.currentTerm
 			rf.votedFor = rf.me
+			rf.persist()
 			rf.voteCount = 1
 			lastLogIndex := len(rf.logs)
 			lastLogTerm := 0
@@ -492,9 +578,10 @@ func (rf *Raft) ticker() {
 								rf.role = Follower
 								rf.currentTerm = rsp.Term
 								rf.votedFor = -1
+								rf.persist()
 								pretty.Debug(pretty.Log, "S%d became follower because RV from S%d", rf.me, i)
 							}
-							if rsp.VoteGranted && rf.role == Candidate {
+							if rsp.VoteGranted && rf.role == Candidate && req.Term == rf.currentTerm {
 								rf.voteCount++
 								pretty.Debug(pretty.Vote, "S%d got vote from S%d", rf.me, i)
 							}
@@ -564,6 +651,7 @@ func sendHeartbeats(rf *Raft, term int) {
 							rf.role = Follower
 							rf.currentTerm = rsp.Term
 							rf.votedFor = -1
+							rf.persist()
 							pretty.Debug(pretty.Log, "S%d became follower because rev HB from S%d", rf.me, i)
 						}
 					}
