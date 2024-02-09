@@ -91,7 +91,7 @@ func (c *Coordinator) Notify(task *Task, rsp *EmptyMsg) error {
 			c.mtasks[tid].state = COMPLETE
 			c.mleft--
 			if c.mleft == 0 {
-				c.rcond.Broadcast()
+				c.rcond.Signal()
 			}
 		}
 	} else { // reduce

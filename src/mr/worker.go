@@ -54,7 +54,7 @@ func PathExists(path string) (bool, error) {
 // main/mrworker.go calls this function.
 func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
-
+	// TODO: ensure closing opened files
 	// Your worker implementation here.
 	for {
 		req := EmptyMsg{}
@@ -73,14 +73,12 @@ func Worker(mapf func(string, string) []KeyValue,
 					continue
 				}
 				content, err := io.ReadAll(file)
+				file.Close()
 				if err != nil {
 					fmt.Printf("cannot read %v\n", filename)
 					continue
 				}
-				file.Close()
 				intermediate := mapf(filename, string(content))
-
-				sort.Sort(ByKey(intermediate))
 
 				if exist, err := PathExists(interDir); !exist {
 					if err != nil {
@@ -108,21 +106,10 @@ func Worker(mapf func(string, string) []KeyValue,
 					encoders = append(encoders, json.NewEncoder(f))
 				}
 
-				i := 0
-				for i < len(intermediate) {
-					j := i + 1
-					for j < len(intermediate) && intermediate[j].Key == intermediate[i].Key {
-						j++
-					}
-					values := []string{}
-					for k := i; k < j; k++ {
-						values = append(values, intermediate[k].Value)
-					}
-
-					hid := ihash(intermediate[i].Key) % rsp.CommonArg
+				for _, p := range intermediate {
+					hid := ihash(p.Key) % rsp.CommonArg
 					enc := encoders[hid]
-					enc.Encode(KeyValueList{intermediate[i].Key, values})
-					i = j
+					enc.Encode(&p)
 				}
 
 				for rid, f := range tmpfiles {
@@ -130,7 +117,7 @@ func Worker(mapf func(string, string) []KeyValue,
 					f.Close()
 				}
 			} else {
-				mp := make(map[string][]string)
+				intermediate := []KeyValue{}
 				interfomat := "intermediate/mr-%d-" + strconv.Itoa(rsp.TaskId)
 				flag := true
 				for i := 0; i < rsp.CommonArg; i++ {
@@ -143,16 +130,17 @@ func Worker(mapf func(string, string) []KeyValue,
 					}
 					dec := json.NewDecoder(f)
 					for {
-						var kvs KeyValueList
+						var kvs KeyValue
 						if err := dec.Decode(&kvs); err != nil {
 							break
 						}
-						mp[kvs.Key] = append(mp[kvs.Key], kvs.Values...)
+						intermediate = append(intermediate, kvs)
 					}
 				}
 				if !flag {
 					continue
 				}
+				sort.Sort(ByKey(intermediate))
 
 				ofile, err := ioutil.TempFile(interDir, "reduce")
 				if err != nil {
@@ -160,22 +148,33 @@ func Worker(mapf func(string, string) []KeyValue,
 					continue
 				}
 
-				for k, v := range mp {
-					output := reducef(k, v)
-					fmt.Fprintf(ofile, "%v %v\n", k, output)
+				i := 0
+				for i < len(intermediate) {
+					j := i + 1
+					for j < len(intermediate) && intermediate[j].Key == intermediate[i].Key {
+						j++
+					}
+					values := []string{}
+					for k := i; k < j; k++ {
+						values = append(values, intermediate[k].Value)
+					}
+					output := reducef(intermediate[i].Key, values)
+
+					// this is the correct format for each line of Reduce output.
+					fmt.Fprintf(ofile, "%v %v\n", intermediate[i].Key, output)
+
+					i = j
 				}
 
 				os.Rename(ofile.Name(), fmt.Sprintf("mr-out-%d", rsp.TaskId))
+				ofile.Close()
 			}
 
 			if rsp.TaskType != 0 {
 				// notify coordinator
 				notify(&rsp.Task)
 			}
-		} else {
-			fmt.Println("call failed!")
 		}
-		// time.Sleep(time.Second * 1)
 	}
 
 	// uncomment to send the Example RPC to the coordinator.
