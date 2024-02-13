@@ -3,4 +3,4 @@ api.key
 .api.key.trimmed
 *-handin.tar.gz
 
-src/raft/output.log
+src/raft/output*.log

@@ -1,4 +1,4 @@
-#!/Users/lychen/anaconda3/envs/py3.8/bin/python
+#!/usr/bin/python
 import sys
 import shutil
 from typing import Optional, List, Tuple, Dict

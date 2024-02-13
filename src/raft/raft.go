@@ -262,7 +262,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	changed = true
 	rf.votedFor = args.CandidateId
 	reply.Term, reply.VoteGranted = rf.currentTerm, true
-	pretty.Debug(pretty.Vote, "S%d granted vote to S%d", rf.me, args.CandidateId)
+	pretty.Debug(pretty.Vote, "S%d granted vote to S%d and became follower", rf.me, args.CandidateId)
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -337,6 +337,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.reElect = false
 	// If AppendEntries RPC received from new leader: convert to follower
 	if rf.role == Candidate {
+		pretty.Debug(pretty.Log, "S%d became follower because rev AE/HB from S%d", rf.me, args.LeaderId)
 		rf.role = Follower
 		if rf.votedFor != -1 {
 			changed = true
@@ -720,24 +721,33 @@ func (rf *Raft) ticker() {
 				}
 			}
 		}
+		if term != -1 {
+			go func(term int) {
+				rf.mu.Lock()
+				for rf.role == Candidate && rf.currentTerm == term {
+					if 2*rf.voteCount > len(rf.peers) {
+						// become leader: set nextIndex and matchIndex initialy
+						pretty.Debug(pretty.Log2, "S%d became leader(%d votes) of term %d", rf.me, rf.voteCount, rf.currentTerm)
+						rf.role = Leader
+						for i := 0; i < len(rf.nextIndex); i++ {
+							rf.nextIndex[i] = rf.logs[0].Index + len(rf.logs)
+							rf.matchIndex[i] = 0
+						}
+						go sendHeartbeats(rf, term)
+						break
+					}
+					rf.mu.Unlock()
+					time.Sleep(time.Duration(100) * time.Millisecond)
+					rf.mu.Lock()
+				}
+				rf.mu.Unlock()
+			}(term)
+		}
 		rf.reElect = true
 		rf.mu.Unlock()
 
 		// sleep for a random time
-		time.Sleep(time.Duration(300+rand.Intn(301)) * time.Millisecond)
-
-		rf.mu.Lock()
-		if rf.role == Candidate && rf.currentTerm == term && 2*rf.voteCount > len(rf.peers) {
-			// become leader: set nextIndex and matchIndex initialy
-			pretty.Debug(pretty.Log2, "S%d became leader(%d votes) of term %d", rf.me, rf.voteCount, rf.currentTerm)
-			rf.role = Leader
-			for i := 0; i < len(rf.nextIndex); i++ {
-				rf.nextIndex[i] = rf.logs[0].Index + len(rf.logs)
-				rf.matchIndex[i] = 0
-			}
-			go sendHeartbeats(rf, term)
-		}
-		rf.mu.Unlock()
+		time.Sleep(time.Duration(200+rand.Intn(201)) * time.Millisecond)
 	}
 }
 
@@ -773,7 +783,7 @@ func sendHeartbeats(rf *Raft, term int) {
 			}
 		}
 		rf.mu.Unlock()
-		time.Sleep(time.Duration(50) * time.Millisecond)
+		time.Sleep(time.Duration(100) * time.Millisecond)
 		rf.mu.Lock()
 	}
 }
