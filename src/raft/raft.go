@@ -651,7 +651,7 @@ func (rf *Raft) replicateEntries(index int, term int) {
 			break
 		}
 		rf.mu.Unlock()
-		time.Sleep(time.Duration(100) * time.Millisecond)
+		time.Sleep(time.Duration(50) * time.Millisecond)
 		rf.mu.Lock()
 	}
 }
@@ -737,7 +737,7 @@ func (rf *Raft) ticker() {
 						break
 					}
 					rf.mu.Unlock()
-					time.Sleep(time.Duration(100) * time.Millisecond)
+					time.Sleep(time.Duration(50) * time.Millisecond)
 					rf.mu.Lock()
 				}
 				rf.mu.Unlock()
@@ -747,7 +747,7 @@ func (rf *Raft) ticker() {
 		rf.mu.Unlock()
 
 		// sleep for a random time
-		time.Sleep(time.Duration(200+rand.Intn(201)) * time.Millisecond)
+		time.Sleep(time.Duration(150+rand.Intn(151)) * time.Millisecond)
 	}
 }
 
@@ -783,7 +783,7 @@ func sendHeartbeats(rf *Raft, term int) {
 			}
 		}
 		rf.mu.Unlock()
-		time.Sleep(time.Duration(100) * time.Millisecond)
+		time.Sleep(time.Duration(50) * time.Millisecond)
 		rf.mu.Lock()
 	}
 }
