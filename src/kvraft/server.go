@@ -25,29 +25,27 @@ type OpType string
 
 const (
 	GET    OpType = "Get"
-	PUT           = "Put"
-	APPEND        = "Append"
+	PUT    OpType = "Put"
+	APPEND OpType = "Append"
 )
 
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
-	Type  OpType
-	Key   string
-	Value string
+	ClientId  int64
+	CommandId int64
+	Type      OpType
+	Key       string
+	Value     string
 }
 
 func (o Op) String() string {
 	if o.Type == GET {
-		return fmt.Sprintf("{type=%s, key=%s}", "GET", o.Key)
+		return fmt.Sprintf("{client_id=%v, cmd_id=%v, type=%s, key=%s}", o.ClientId, o.CommandId, o.Type, o.Key)
 	} else {
-		return fmt.Sprintf("{type=%s, key=%s, value=%s}", o.Type, o.Key, o.Value)
+		return fmt.Sprintf("{client_id=%v, cmd_id=%v, type=%s, key=%s, value=%s}", o.ClientId, o.CommandId, o.Type, o.Key, o.Value)
 	}
-}
-
-type ApplyChEvent struct {
-	index int
 }
 
 type KVServer struct {
@@ -60,74 +58,151 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
-	waitingEvent map[int]chan ApplyChEvent
-	kvStore      map[string]string
+	kvStore     map[string]string
+	clients     map[int64]*OpCache
+	lastApplied map[int64]int64
+}
+
+func (kv *KVServer) createOpCacheWithLock(op Op, term int, index int) *OpCache {
+	opCache := NewOpCache(op.ClientId, op.CommandId, op.Type, op.Key, op.Value, term, index)
+	kv.clients[opCache.clientId] = opCache
+	go func() {
+		for !opCache.finished() {
+			time.Sleep(time.Millisecond * 250)
+			currentTerm, isLeader := kv.rf.GetState()
+			kv.mu.Lock()
+			DPrintf("S%d isLeader[%v] curTerm[%v] opCache%v\n", kv.me, isLeader, currentTerm, opCache)
+			if !isLeader || opCache.term != currentTerm {
+				if opCache.completeIfUnfinished("", ErrWrongLeader) {
+					DPrintf("S%d: %v timeout\n", kv.me, opCache)
+				}
+				kv.mu.Unlock()
+				return
+			}
+			kv.mu.Unlock()
+		}
+		DPrintf("S%d opCache finish, opCache%v\n", kv.me, opCache)
+	}()
+	return opCache
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
-	event := make(chan ApplyChEvent)
+	DPrintf("S%d get req, args%v\n", kv.me, args)
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
-	op := Op{Type: GET, Key: args.Key}
-	index, _, isLeader := kv.rf.Start(op)
-	if !isLeader {
-		reply.Err = ErrWrongLeader
-		return
-	}
-	DPrintf("S%d op[%d], req%v\n", kv.me, index, args)
-	kv.waitingEvent[index] = event
-	kv.mu.Unlock()
-	<-event
-	kv.mu.Lock()
-	val, exist := kv.kvStore[args.Key]
-	if exist {
-		reply.Err = OK
-		reply.Value = val
+	opCache, exist := kv.clients[args.ClientId]
+	if !exist || args.CommandId > opCache.commandId {
+		// new command
+		op := Op{ClientId: args.ClientId, CommandId: args.CommandId, Type: GET, Key: args.Key}
+		index, currentTerm, isLeader := kv.rf.Start(op)
+		if !isLeader {
+			reply.Err = ErrWrongLeader
+			return
+		}
+		opCache = kv.createOpCacheWithLock(op, currentTerm, index)
+		kv.mu.Unlock()
+		result, err := opCache.get()
+		reply.Value, reply.Err = result, err
+		kv.mu.Lock()
+		if err != OK { // TODO
+			delete(kv.clients, args.ClientId)
+		}
+	} else if args.CommandId == opCache.commandId {
+		// duplicate command
+		kv.mu.Unlock()
+		result, err := opCache.get()
+		reply.Value, reply.Err = result, err
+		kv.mu.Lock()
+		if err != OK {
+			delete(kv.clients, args.ClientId)
+		}
 	} else {
-		reply.Err = ErrNoKey
-		reply.Value = ""
+		log.Panicf("S%v receive invalid id (opCache.id=%v). args=%v, opCache=%v.", kv.me, opCache.commandId, args, opCache)
 	}
-	DPrintf("S%d op[%d], rsp%v\n", kv.me, index, reply)
+	DPrintf("S%d finish req, args%v, rsp%v\n", kv.me, args, reply)
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
-	event := make(chan ApplyChEvent)
+	DPrintf("S%d get req, args%v\n", kv.me, args)
 	kv.mu.Lock()
-	op := Op{Type: OpType(args.Op), Key: args.Key, Value: args.Value}
-	index, _, isLeader := kv.rf.Start(op)
-	if !isLeader {
-		reply.Err = ErrWrongLeader
+	defer kv.mu.Unlock()
+	opCache, exist := kv.clients[args.ClientId]
+	if !exist || args.CommandId > opCache.commandId {
+		// new command
+		op := Op{ClientId: args.ClientId, CommandId: args.CommandId, Type: OpType(args.Op), Key: args.Key, Value: args.Value}
+		index, currentTerm, isLeader := kv.rf.Start(op)
+		if !isLeader {
+			reply.Err = ErrWrongLeader
+			return
+		}
+		opCache = kv.createOpCacheWithLock(op, currentTerm, index)
 		kv.mu.Unlock()
-		return
+		_, err := opCache.get()
+		reply.Err = err
+		kv.mu.Lock()
+		if err != OK {
+			delete(kv.clients, args.ClientId)
+		}
+	} else if args.CommandId == opCache.commandId {
+		// duplicate command
+		kv.mu.Unlock()
+		_, err := opCache.get()
+		reply.Err = err
+		kv.mu.Lock()
+		if err != OK {
+			delete(kv.clients, args.ClientId)
+		}
+	} else {
+		log.Panicf("S%v receive invalid id (opCache.id=%v). args=%v, opCache=%v.", kv.me, opCache.commandId, args, opCache)
 	}
-	DPrintf("S%d op[%d], req%v\n", kv.me, index, args)
-	kv.waitingEvent[index] = event
-	kv.mu.Unlock()
-	<-event
-	reply.Err = OK
-	DPrintf("S%d op[%d], rsp%v\n", kv.me, index, reply)
+	DPrintf("S%d finish req, args%v, rsp%v\n", kv.me, args, reply)
 }
 
 func (kv *KVServer) applyChRecevier() {
 	for !kv.killed() {
-		select {
-		case msg := <-kv.applyCh:
-			op, _ := msg.Command.(Op)
-			kv.mu.Lock()
-			event := kv.waitingEvent[msg.CommandIndex]
+		msg := <-kv.applyCh
+		kv.mu.Lock()
+		DPrintf("S%d: Receive apply msg: %v\n", kv.me, msg)
+		op := msg.Command.(Op)
+		// update state machine
+		result := ""
+		lastApplied := kv.lastApplied[op.ClientId]
+		if op.CommandId != lastApplied && op.CommandId != lastApplied+1 {
+			log.Panicf("S%d receive msg with invalid command id. msg=%v, lastApplied=%v\n", kv.me, msg, lastApplied)
+		}
+		if op.CommandId == lastApplied+1 {
 			if op.Type == PUT {
 				kv.kvStore[op.Key] = op.Value
 			} else if op.Type == APPEND {
 				kv.kvStore[op.Key] += op.Value
+			} else {
+				result = kv.kvStore[op.Key]
 			}
 			DPrintf("S%d apply op[%d], op%v\n", kv.me, msg.CommandIndex, op)
-			kv.mu.Unlock()
-			event <- ApplyChEvent{msg.CommandIndex}
-		default:
-			time.Sleep(50 * time.Millisecond)
+		} else {
+			if op.Type == GET {
+				result = kv.kvStore[op.Key]
+			}
 		}
+		kv.lastApplied[op.ClientId] = op.CommandId
+
+		opCache, exist := kv.clients[op.ClientId]
+		if !exist || op.CommandId > opCache.commandId {
+			// new command
+			if exist {
+				opCache.ensureFinished()
+			}
+			opCache = kv.createOpCacheWithLock(op, -1, -1)
+			opCache.complete(result, OK)
+		} else if opCache.commandId == op.CommandId {
+			opCache.completeIfUnfinished(result, OK)
+		} else {
+			DPrintf("S%d: receive outdated msg, just update state but not change opCache. msg=%v, opCache=%v.", kv.me, msg, opCache)
+		}
+
+		kv.mu.Unlock()
 	}
 }
 
@@ -170,6 +245,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	// call labgob.Register on structures you want
 	// Go's RPC library to marshall/unmarshall.
 	labgob.Register(Op{})
+	log.SetFlags(log.Ldate | log.Ltime | log.Lshortfile)
 
 	kv := new(KVServer)
 	kv.me = me
@@ -181,8 +257,9 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	// You may need initialization code here.
-	kv.waitingEvent = make(map[int]chan ApplyChEvent)
 	kv.kvStore = make(map[string]string)
+	kv.clients = make(map[int64]*OpCache)
+	kv.lastApplied = make(map[int64]int64)
 
 	go kv.applyChRecevier()
 
