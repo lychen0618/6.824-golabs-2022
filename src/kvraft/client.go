@@ -1,9 +1,12 @@
 package kvraft
 
-import "6.824/labrpc"
-import "crypto/rand"
-import "math/big"
+import (
+	"crypto/rand"
+	"math/big"
+	"time"
 
+	"6.824/labrpc"
+)
 
 type Clerk struct {
 	servers []*labrpc.ClientEnd
@@ -24,6 +27,16 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	return ck
 }
 
+func (ck *Clerk) sendKVGet(server int, args *GetArgs, reply *GetReply) bool {
+	ok := ck.servers[server].Call("KVServer.Get", args, reply)
+	return ok
+}
+
+func (ck *Clerk) sendKVPutAppend(server int, args *PutAppendArgs, reply *PutAppendReply) bool {
+	ok := ck.servers[server].Call("KVServer.PutAppend", args, reply)
+	return ok
+}
+
 //
 // fetch the current value for a key.
 // returns "" if the key does not exist.
@@ -37,9 +50,17 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 // arguments. and reply must be passed as a pointer.
 //
 func (ck *Clerk) Get(key string) string {
-
 	// You will have to modify this function.
-	return ""
+	for {
+		for si := 0; si < len(ck.servers); si++ {
+			args, reply := GetArgs{key}, GetReply{}
+			ok := ck.sendKVGet(si, &args, &reply)
+			if ok && (reply.Err == ErrNoKey || reply.Err == OK) {
+				return reply.Value
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 }
 
 //
@@ -54,6 +75,16 @@ func (ck *Clerk) Get(key string) string {
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
+	for {
+		for si := 0; si < len(ck.servers); si++ {
+			args, reply := PutAppendArgs{key, value, op}, PutAppendReply{}
+			ok := ck.sendKVPutAppend(si, &args, &reply)
+			if ok && reply.Err == OK {
+				return
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 }
 
 func (ck *Clerk) Put(key string, value string) {
