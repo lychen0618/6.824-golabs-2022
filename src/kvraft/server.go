@@ -1,6 +1,7 @@
 package kvraft
 
 import (
+	"bytes"
 	"fmt"
 	"log"
 	"sync"
@@ -65,11 +66,13 @@ type KVServer struct {
 	dead    int32 // set by Kill()
 
 	maxraftstate int // snapshot if log grows this big
+	persister    *raft.Persister
 
 	// Your definitions here.
 	kvStore           map[string]string
 	clients           map[int64]*ClientHandler
 	lastExecutedOpMap map[int64]ExecutedOp
+	lastAppliedIndex  int
 }
 
 func (kv *KVServer) handleRequest(clientId int64, commandId int64, opType OpType, key string, value string) (result string, err Err) {
@@ -86,7 +89,7 @@ func (kv *KVServer) handleRequest(clientId int64, commandId int64, opType OpType
 			// duplicate command, so fast return
 			handler.complete(lastExecutedOp.Result, OK)
 			kv.mu.Unlock()
-			return handler.result, handler.err
+			return handler.get()
 		}
 	}
 	kv.mu.Unlock()
@@ -146,7 +149,7 @@ func (kv *KVServer) handleApplyMsg(msg raft.ApplyMsg) {
 		result := ""
 		lastExecutedOp := kv.lastExecutedOpMap[op.ClientId]
 		if op.CommandId != lastExecutedOp.CommandId && op.CommandId != lastExecutedOp.CommandId+1 {
-			log.Panicf("S%d receive msg with invalid command id. msg=%v, lastAppliedCmdId=%v\n", kv.me, msg, lastExecutedOp.CommandId)
+			log.Panicf("S%d receive msg with invalid command id. msg=%v, lastExecutedOpCmdId=%v\n", kv.me, msg, lastExecutedOp.CommandId)
 		}
 		if op.CommandId == lastExecutedOp.CommandId+1 {
 			if op.Type == PUT {
@@ -165,6 +168,34 @@ func (kv *KVServer) handleApplyMsg(msg raft.ApplyMsg) {
 		handler, exist := kv.clients[op.ClientId]
 		if exist && handler.commandId == op.CommandId {
 			handler.complete(result, OK)
+		}
+		if msg.CommandIndex <= kv.lastAppliedIndex {
+			log.Panicf("S%d received invalid apply msg, raft_cmd_id=%v, last_applied_id=%v", kv.me, msg.CommandIndex, kv.lastAppliedIndex)
+		}
+		kv.lastAppliedIndex = msg.CommandIndex
+	} else if msg.SnapshotValid {
+		// receive snapshot indicate is not leader
+		if msg.SnapshotIndex < kv.lastAppliedIndex {
+			log.Panicf("S%d received invalid snapshot msg, snap_shot_id=%v, last_applied_id=%v", kv.me, msg.SnapshotIndex, kv.lastAppliedIndex)
+		}
+		kv.kvStore, kv.lastAppliedIndex, kv.lastExecutedOpMap = kv.decodeState(msg.Snapshot)
+		for _, op := range kv.lastExecutedOpMap {
+			handler, exist := kv.clients[op.ClientId]
+			if exist && handler.commandId == op.CommandId {
+				handler.complete(op.Result, OK)
+			}
+		}
+		DPrintf("S%d: update lastExecutedOpMap: %v\n", kv.me, kv.lastExecutedOpMap)
+	} else {
+		log.Panicf("S%d received invalid apply msg%v\n", kv.me, msg)
+	}
+
+	if kv.maxraftstate > 0 {
+		raftStateSize := kv.persister.RaftStateSize()
+		if raftStateSize > kv.maxraftstate {
+			DPrintf("S%d: raft state size greater maxraftstate(%v > %v), trim log.\n", kv.me, raftStateSize, kv.maxraftstate)
+			snapshot := kv.encodeState(kv.kvStore, kv.lastAppliedIndex, kv.lastExecutedOpMap)
+			kv.rf.Snapshot(kv.lastAppliedIndex, snapshot)
 		}
 	}
 }
@@ -188,6 +219,36 @@ func (kv *KVServer) Kill() {
 func (kv *KVServer) killed() bool {
 	z := atomic.LoadInt32(&kv.dead)
 	return z == 1
+}
+
+func (kv *KVServer) encodeState(kvStore map[string]string, lastAppliedIndex int, lastExecutedOpMap map[int64]ExecutedOp) []byte {
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	if err := e.Encode(kvStore); err != nil {
+		log.Panicf("S%d fail to encode kvStore: %v", kv.me, kvStore)
+	}
+	if err := e.Encode(lastAppliedIndex); err != nil {
+		log.Panicf("S%d fail to encode lastAppliedIndex: %v", kv.me, lastAppliedIndex)
+	}
+	if err := e.Encode(lastExecutedOpMap); err != nil {
+		log.Panicf("S%d fail to encode lastExecutedOpMap: %v", kv.me, lastExecutedOpMap)
+	}
+	return w.Bytes()
+}
+
+func (kv *KVServer) decodeState(data []byte) (kvStore map[string]string, lastAppliedIndex int, lastExecutedOpMap map[int64]ExecutedOp) {
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	if err := d.Decode(&kvStore); err != nil {
+		log.Panicf("S%d fail to decode kvStore: %v", kv.me, kvStore)
+	}
+	if err := d.Decode(&lastAppliedIndex); err != nil {
+		log.Panicf("S%d fail to decode lastAppliedIndex: %v", kv.me, lastAppliedIndex)
+	}
+	if err := d.Decode(&lastExecutedOpMap); err != nil {
+		log.Panicf("S%d fail to decode lastExecutedOpMap: %v", kv.me, lastExecutedOpMap)
+	}
+	return
 }
 
 //
@@ -223,6 +284,10 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.kvStore = make(map[string]string)
 	kv.clients = make(map[int64]*ClientHandler)
 	kv.lastExecutedOpMap = make(map[int64]ExecutedOp)
+	kv.persister = persister
+	if persister.SnapshotSize() != 0 {
+		kv.kvStore, kv.lastAppliedIndex, kv.lastExecutedOpMap = kv.decodeState(persister.ReadSnapshot())
+	}
 
 	go func() {
 		for !kv.killed() {
