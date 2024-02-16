@@ -480,7 +480,9 @@ func (rf *Raft) getLogById(id int) *LogEntry {
 
 // [st, ed]
 func (rf *Raft) getLogsByRange(st int, ed int) []LogEntry {
-	return rf.logs[st-rf.logs[0].Index : ed-rf.logs[0].Index+1]
+	logs := make([]LogEntry, 0)
+	logs = append(logs, rf.logs[st-rf.logs[0].Index:ed-rf.logs[0].Index+1]...)
+	return logs
 }
 
 type InstallSnapshotArgs struct {

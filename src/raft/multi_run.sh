@@ -12,8 +12,8 @@ do
     #     log_output 32 "PASS Tests[${INDEX}] Round[${i}]"
     #     rm -rf output_${INDEX}.log
     # fi
-    go test -run=2A -race
-    go test -run=2B -race
-    go test -run=2C -race
-    go test -run=2D -race
+    go test -run 2A -race
+    go test -run 2B -race
+    go test -run 2C -race
+    go test -run 2D -race
 done
