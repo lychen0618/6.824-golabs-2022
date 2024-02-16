@@ -48,6 +48,15 @@ func (o Op) String() string {
 	}
 }
 
+type ExecutedOp struct {
+	Op
+	Result string
+}
+
+func (ec ExecutedOp) String() string {
+	return fmt.Sprintf("{op=%v, result=%v}", ec.Op, ec.Result)
+}
+
 type KVServer struct {
 	mu      sync.Mutex
 	me      int
@@ -58,121 +67,88 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
-	kvStore     map[string]string
-	clients     map[int64]*OpCache
-	lastApplied map[int64]int64
+	kvStore           map[string]string
+	clients           map[int64]*ClientHandler
+	lastExecutedOpMap map[int64]ExecutedOp
 }
 
-func (kv *KVServer) createOpCacheWithLock(op Op, term int, index int) *OpCache {
-	opCache := NewOpCache(op.ClientId, op.CommandId, op.Type, op.Key, op.Value, term, index)
-	kv.clients[opCache.clientId] = opCache
-	go func() {
-		for !opCache.finished() {
+func (kv *KVServer) handleRequest(clientId int64, commandId int64, opType OpType, key string, value string) (result string, err Err) {
+	DPrintf("S%d handle req, client_id=%v, cmd_id=%v, type=%s, key=%s, value=%s\n", kv.me, clientId, commandId, opType, key, value)
+	kv.mu.Lock()
+	handler, exist := kv.clients[clientId]
+	if !exist || commandId > handler.commandId {
+		handler = NewClientHandler(clientId, commandId)
+		kv.clients[clientId] = handler
+	}
+	if commandId == handler.commandId {
+		lastExecutedOp, exist := kv.lastExecutedOpMap[clientId]
+		if exist && lastExecutedOp.CommandId == commandId {
+			// duplicate command, so fast return
+			handler.complete(lastExecutedOp.Result, OK)
+			kv.mu.Unlock()
+			return handler.result, handler.err
+		}
+	}
+	kv.mu.Unlock()
+	if commandId < handler.commandId {
+		log.Panicf("S%d receive invalid cmd_id(%v), handler%v.", kv.me, commandId, handler)
+	}
+
+	// start new round raft agreement
+	op := Op{ClientId: clientId, CommandId: commandId, Type: opType, Key: key, Value: value}
+	_, currentTerm, isLeader := kv.rf.Start(op)
+	if !isLeader {
+		return "", ErrWrongLeader
+	}
+	// start leadership checking
+	go func(term int, op *Op) {
+		for !kv.killed() && !handler.finished() {
 			time.Sleep(time.Millisecond * 250)
 			currentTerm, isLeader := kv.rf.GetState()
 			kv.mu.Lock()
-			DPrintf("S%d isLeader[%v] curTerm[%v] opCache%v\n", kv.me, isLeader, currentTerm, opCache)
-			if !isLeader || opCache.term != currentTerm {
-				if opCache.completeIfUnfinished("", ErrWrongLeader) {
-					DPrintf("S%d: %v timeout\n", kv.me, opCache)
+			DPrintf("S%d isLeader[%v] curTerm[%v] handler%v op%v\n", kv.me, isLeader, currentTerm, handler, op)
+			if !isLeader || term != currentTerm {
+				if handler.completeIfUnfinished("", ErrWrongLeader) {
+					DPrintf("S%d timeout, handler%v op%v\n", kv.me, handler, op)
 				}
 				kv.mu.Unlock()
 				return
 			}
 			kv.mu.Unlock()
 		}
-		DPrintf("S%d opCache finish, opCache%v\n", kv.me, opCache)
-	}()
-	return opCache
+		DPrintf("S%d stop checking leader state, op%v\n", kv.me, op)
+	}(currentTerm, &op)
+	return handler.get()
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
-	DPrintf("S%d get req, args%v\n", kv.me, args)
-	kv.mu.Lock()
-	defer kv.mu.Unlock()
-	opCache, exist := kv.clients[args.ClientId]
-	if !exist || args.CommandId > opCache.commandId {
-		// new command
-		op := Op{ClientId: args.ClientId, CommandId: args.CommandId, Type: GET, Key: args.Key}
-		index, currentTerm, isLeader := kv.rf.Start(op)
-		if !isLeader {
-			reply.Err = ErrWrongLeader
-			return
-		}
-		opCache = kv.createOpCacheWithLock(op, currentTerm, index)
-		kv.mu.Unlock()
-		result, err := opCache.get()
-		reply.Value, reply.Err = result, err
-		kv.mu.Lock()
-		if err != OK { // TODO
-			delete(kv.clients, args.ClientId)
-		}
-	} else if args.CommandId == opCache.commandId {
-		// duplicate command
-		kv.mu.Unlock()
-		result, err := opCache.get()
-		reply.Value, reply.Err = result, err
-		kv.mu.Lock()
-		if err != OK {
-			delete(kv.clients, args.ClientId)
-		}
-	} else {
-		log.Panicf("S%v receive invalid id (opCache.id=%v). args=%v, opCache=%v.", kv.me, opCache.commandId, args, opCache)
-	}
+	result, err := kv.handleRequest(args.ClientId, args.CommandId, GET, args.Key, "VALUE_GET")
+	reply.Value = result
+	reply.Err = err
 	DPrintf("S%d finish req, args%v, rsp%v\n", kv.me, args, reply)
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
-	DPrintf("S%d get req, args%v\n", kv.me, args)
-	kv.mu.Lock()
-	defer kv.mu.Unlock()
-	opCache, exist := kv.clients[args.ClientId]
-	if !exist || args.CommandId > opCache.commandId {
-		// new command
-		op := Op{ClientId: args.ClientId, CommandId: args.CommandId, Type: OpType(args.Op), Key: args.Key, Value: args.Value}
-		index, currentTerm, isLeader := kv.rf.Start(op)
-		if !isLeader {
-			reply.Err = ErrWrongLeader
-			return
-		}
-		opCache = kv.createOpCacheWithLock(op, currentTerm, index)
-		kv.mu.Unlock()
-		_, err := opCache.get()
-		reply.Err = err
-		kv.mu.Lock()
-		if err != OK {
-			delete(kv.clients, args.ClientId)
-		}
-	} else if args.CommandId == opCache.commandId {
-		// duplicate command
-		kv.mu.Unlock()
-		_, err := opCache.get()
-		reply.Err = err
-		kv.mu.Lock()
-		if err != OK {
-			delete(kv.clients, args.ClientId)
-		}
-	} else {
-		log.Panicf("S%v receive invalid id (opCache.id=%v). args=%v, opCache=%v.", kv.me, opCache.commandId, args, opCache)
-	}
+	_, err := kv.handleRequest(args.ClientId, args.CommandId, OpType(args.Op), args.Key, args.Value)
+	reply.Err = err
 	DPrintf("S%d finish req, args%v, rsp%v\n", kv.me, args, reply)
 }
 
-func (kv *KVServer) applyChRecevier() {
-	for !kv.killed() {
-		msg := <-kv.applyCh
-		kv.mu.Lock()
-		DPrintf("S%d: Receive apply msg: %v\n", kv.me, msg)
+func (kv *KVServer) handleApplyMsg(msg raft.ApplyMsg) {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	if msg.CommandValid {
 		op := msg.Command.(Op)
 		// update state machine
 		result := ""
-		lastApplied := kv.lastApplied[op.ClientId]
-		if op.CommandId != lastApplied && op.CommandId != lastApplied+1 {
-			log.Panicf("S%d receive msg with invalid command id. msg=%v, lastApplied=%v\n", kv.me, msg, lastApplied)
+		lastExecutedOp := kv.lastExecutedOpMap[op.ClientId]
+		if op.CommandId != lastExecutedOp.CommandId && op.CommandId != lastExecutedOp.CommandId+1 {
+			log.Panicf("S%d receive msg with invalid command id. msg=%v, lastAppliedCmdId=%v\n", kv.me, msg, lastExecutedOp.CommandId)
 		}
-		if op.CommandId == lastApplied+1 {
+		if op.CommandId == lastExecutedOp.CommandId+1 {
 			if op.Type == PUT {
 				kv.kvStore[op.Key] = op.Value
 			} else if op.Type == APPEND {
@@ -180,29 +156,16 @@ func (kv *KVServer) applyChRecevier() {
 			} else {
 				result = kv.kvStore[op.Key]
 			}
+			kv.lastExecutedOpMap[op.ClientId] = ExecutedOp{Op: op, Result: result}
 			DPrintf("S%d apply op[%d], op%v\n", kv.me, msg.CommandIndex, op)
 		} else {
-			if op.Type == GET {
-				result = kv.kvStore[op.Key]
-			}
-		}
-		kv.lastApplied[op.ClientId] = op.CommandId
-
-		opCache, exist := kv.clients[op.ClientId]
-		if !exist || op.CommandId > opCache.commandId {
-			// new command
-			if exist {
-				opCache.ensureFinished()
-			}
-			opCache = kv.createOpCacheWithLock(op, -1, -1)
-			opCache.complete(result, OK)
-		} else if opCache.commandId == op.CommandId {
-			opCache.completeIfUnfinished(result, OK)
-		} else {
-			DPrintf("S%d: receive outdated msg, just update state but not change opCache. msg=%v, opCache=%v.", kv.me, msg, opCache)
+			result = lastExecutedOp.Result
 		}
 
-		kv.mu.Unlock()
+		handler, exist := kv.clients[op.ClientId]
+		if exist && handler.commandId == op.CommandId {
+			handler.complete(result, OK)
+		}
 	}
 }
 
@@ -258,10 +221,16 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	// You may need initialization code here.
 	kv.kvStore = make(map[string]string)
-	kv.clients = make(map[int64]*OpCache)
-	kv.lastApplied = make(map[int64]int64)
+	kv.clients = make(map[int64]*ClientHandler)
+	kv.lastExecutedOpMap = make(map[int64]ExecutedOp)
 
-	go kv.applyChRecevier()
+	go func() {
+		for !kv.killed() {
+			msg := <-kv.applyCh
+			DPrintf("S%d: handle apply msg: %v\n", kv.me, msg)
+			kv.handleApplyMsg(msg)
+		}
+	}()
 
 	return kv
 }

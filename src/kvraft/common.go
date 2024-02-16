@@ -2,7 +2,6 @@ package kvraft
 
 import (
 	"fmt"
-	"log"
 	"sync"
 )
 
@@ -59,84 +58,58 @@ func (reply GetReply) String() string {
 	return fmt.Sprintf("{err=%v, value=%v}", reply.Err, reply.Value)
 }
 
-type OpCache struct {
+type ClientHandler struct {
 	mu        sync.Mutex
 	cond      *sync.Cond
 	clientId  int64
 	commandId int64
-	appliedId int64
-	opType    OpType
-	key       string
-	value     string
-	term      int
-	index     int
 	result    string
 	err       Err
 }
 
-func (oc *OpCache) String() string {
-	return fmt.Sprintf("{client_id=%v, cmd_id=%v, opType=%v, key=%v, value=%v, term=%v, index=%v, result=%v, err=%v}", oc.clientId, oc.commandId, oc.opType, oc.key, oc.value, oc.term, oc.index, oc.result, oc.err)
+func (c *ClientHandler) String() string {
+	return fmt.Sprintf("{client_id=%v, cmd_id=%v, result=%v, err=%v}", c.clientId, c.commandId, c.result, c.err)
 }
 
-func NewOpCache(clientId int64, commandId int64, opType OpType, key string, value string, term int, index int) *OpCache {
-	oc := OpCache{}
-	oc.mu.Lock()
-	defer oc.mu.Unlock()
-	oc.cond = sync.NewCond(&oc.mu)
-	oc.clientId = clientId
-	oc.commandId = commandId
-	oc.opType = opType
-	oc.key = key
-	oc.value = value
-	oc.term = term
-	oc.index = index
-	oc.err = WaitComplete
-	oc.appliedId = 0
-	return &oc
-}
-
-func (oc *OpCache) complete(result string, err Err) {
-	oc.mu.Lock()
-	defer oc.mu.Unlock()
-	if oc.err != WaitComplete {
-		log.Panicf("already finished: %v.", oc)
+func NewClientHandler(clientId int64, commandId int64) *ClientHandler {
+	handler := ClientHandler{
+		clientId:  clientId,
+		commandId: commandId,
+		err:       WaitComplete,
 	}
-	oc.result = result
-	oc.err = err
-	oc.cond.Broadcast()
+	handler.cond = sync.NewCond(&handler.mu)
+	return &handler
 }
 
-func (oc *OpCache) ensureFinished() {
-	oc.mu.Lock()
-	defer oc.mu.Unlock()
-	if oc.err == WaitComplete {
-		log.Panicf("not finished: %v.", oc)
-	}
+func (handler *ClientHandler) complete(result string, err Err) {
+	handler.mu.Lock()
+	defer handler.mu.Unlock()
+	handler.result, handler.err = result, err
+	handler.cond.Broadcast()
 }
 
-func (oc *OpCache) finished() bool {
-	oc.mu.Lock()
-	defer oc.mu.Unlock()
-	return oc.err != WaitComplete
+func (handler *ClientHandler) finished() bool {
+	handler.mu.Lock()
+	defer handler.mu.Unlock()
+	return handler.err != WaitComplete
 }
 
-func (oc *OpCache) completeIfUnfinished(result string, err Err) bool {
-	oc.mu.Lock()
-	defer oc.mu.Unlock()
-	if oc.err == WaitComplete {
-		oc.result = result
-		oc.err = err
-		oc.cond.Broadcast()
+func (handler *ClientHandler) completeIfUnfinished(result string, err Err) bool {
+	handler.mu.Lock()
+	defer handler.mu.Unlock()
+	if handler.err == WaitComplete {
+		handler.result, handler.err = result, err
+		handler.cond.Broadcast()
 		return true
 	}
 	return false
 }
 
-func (oc *OpCache) get() (string, Err) {
-	oc.mu.Lock()
-	defer oc.mu.Unlock()
-	for oc.err == WaitComplete {
-		oc.cond.Wait()
+func (handler *ClientHandler) get() (string, Err) {
+	handler.mu.Lock()
+	defer handler.mu.Unlock()
+	for handler.err == WaitComplete {
+		handler.cond.Wait()
 	}
-	return oc.result, oc.err
+	return handler.result, handler.err
 }
