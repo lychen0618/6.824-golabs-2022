@@ -9,7 +9,6 @@ const (
 	OK             = "OK"
 	WaitComplete   = "WaitComplete"
 	ErrWrongLeader = "ErrWrongLeader"
-	ErrOutdateRPC  = "ErrOutDateRPC"
 )
 
 type Err string

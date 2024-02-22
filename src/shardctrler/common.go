@@ -1,5 +1,10 @@
 package shardctrler
 
+import (
+	"fmt"
+	"sync"
+)
+
 //
 // Shard controler: assigns shards to replication groups.
 //
@@ -29,13 +34,17 @@ type Config struct {
 }
 
 const (
-	OK = "OK"
+	OK             = "OK"
+	WaitComplete   = "WaitComplete"
+	ErrWrongLeader = "ErrWrongLeader"
 )
 
 type Err string
 
 type JoinArgs struct {
-	Servers map[int][]string // new GID -> servers mappings
+	ClientId  int64
+	CommandId int64
+	Servers   map[int][]string // new GID -> servers mappings
 }
 
 type JoinReply struct {
@@ -44,7 +53,9 @@ type JoinReply struct {
 }
 
 type LeaveArgs struct {
-	GIDs []int
+	ClientId  int64
+	CommandId int64
+	GIDs      []int
 }
 
 type LeaveReply struct {
@@ -53,8 +64,10 @@ type LeaveReply struct {
 }
 
 type MoveArgs struct {
-	Shard int
-	GID   int
+	ClientId  int64
+	CommandId int64
+	Shard     int
+	GID       int
 }
 
 type MoveReply struct {
@@ -63,11 +76,69 @@ type MoveReply struct {
 }
 
 type QueryArgs struct {
-	Num int // desired config number
+	ClientId  int64
+	CommandId int64
+	Num       int // desired config number
 }
 
 type QueryReply struct {
 	WrongLeader bool
 	Err         Err
 	Config      Config
+}
+
+type ClientHandler struct {
+	mu        sync.Mutex
+	cond      *sync.Cond
+	clientId  int64
+	commandId int64
+	result    Config
+	err       Err
+}
+
+func (c *ClientHandler) String() string {
+	return fmt.Sprintf("{client_id=%v, cmd_id=%v, result=%v, err=%v}", c.clientId, c.commandId, c.result, c.err)
+}
+
+func NewClientHandler(clientId int64, commandId int64) *ClientHandler {
+	handler := ClientHandler{
+		clientId:  clientId,
+		commandId: commandId,
+		err:       WaitComplete,
+	}
+	handler.cond = sync.NewCond(&handler.mu)
+	return &handler
+}
+
+func (handler *ClientHandler) complete(result Config, err Err) {
+	handler.mu.Lock()
+	defer handler.mu.Unlock()
+	handler.result, handler.err = result, err
+	handler.cond.Broadcast()
+}
+
+func (handler *ClientHandler) finished() bool {
+	handler.mu.Lock()
+	defer handler.mu.Unlock()
+	return handler.err != WaitComplete
+}
+
+func (handler *ClientHandler) completeIfUnfinished(result Config, err Err) bool {
+	handler.mu.Lock()
+	defer handler.mu.Unlock()
+	if handler.err == WaitComplete {
+		handler.result, handler.err = result, err
+		handler.cond.Broadcast()
+		return true
+	}
+	return false
+}
+
+func (handler *ClientHandler) get() (Config, Err) {
+	handler.mu.Lock()
+	defer handler.mu.Unlock()
+	for handler.err == WaitComplete {
+		handler.cond.Wait()
+	}
+	return handler.result, handler.err
 }
